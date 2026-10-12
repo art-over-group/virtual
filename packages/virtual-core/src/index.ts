@@ -56,6 +56,11 @@ export interface Range {
   endIndex: number
   overscan: number
   count: number
+  /**
+   * Lane count of the virtualizer. When greater than 1, `overscan` counts
+   * rows of `lanes` items rather than single items.
+   */
+  lanes?: number
 }
 
 type Key = number | string | bigint
@@ -84,8 +89,13 @@ const getRect = (element: HTMLElement): Rect => {
 export const defaultKeyExtractor = (index: number) => index
 
 export const defaultRangeExtractor = (range: Range) => {
-  const start = Math.max(range.startIndex - range.overscan, 0)
-  const end = Math.min(range.endIndex + range.overscan, range.count - 1)
+  // With lanes, the visible range is already aligned to whole rows; overscan
+  // by whole rows too, so every lane gets the same number of items rendered
+  // (and measured). Overscanning single items leaves partial rows, letting one
+  // lane collect more measured sizes than the others and drift (#1036).
+  const overscan = range.overscan * Math.max(range.lanes ?? 1, 1)
+  const start = Math.max(range.startIndex - overscan, 0)
+  const end = Math.min(range.endIndex + overscan, range.count - 1)
   const len = end - start + 1
 
   const arr = new Array<number>(len)
@@ -383,6 +393,8 @@ type ScrollState = {
   index: number | null
   align: ScrollAlignment
   behavior: ScrollBehavior
+  // scrollToEnd: track the DOM max scroll offset instead of the item's offset
+  toEnd?: boolean
 
   // lifecycle
   startedAt: number
@@ -392,6 +404,8 @@ type ScrollState = {
 
   // settling
   stableFrames: number
+  // Keep arrival across measurement-driven retargets so external scrolls can cancel.
+  hasReachedTarget: boolean
 }
 
 type PendingScrollAnchor = [
@@ -501,6 +515,9 @@ export class Virtualizer<
         instance: Virtualizer<TScrollElement, TItemElement>,
       ) => boolean)
   elementsCache = new Map<Key, TItemElement>()
+  // Set while a ResizeObserver callback measures its entries; `resizeItem`
+  // records the pending notify here instead of firing it per entry.
+  private _resizeBatch: { sync: boolean; notify?: boolean } | null = null
   private now = () => this.targetWindow?.performance?.now?.() ?? Date.now()
   private observer = (() => {
     let _ro: ResizeObserver | null = null
@@ -515,44 +532,58 @@ export class Virtualizer<
       }
 
       return (_ro = new this.targetWindow.ResizeObserver((entries) => {
-        entries.forEach((entry) => {
-          const run = () => {
-            const node = entry.target as TItemElement
-            const index = this.indexFromElement(node)
-
-            if (!node.isConnected) {
-              this.observer.unobserve(node)
-              // Find the cache entry pointing to this exact node and remove
-              // it. We can't call getItemKey(index) here because items may
-              // have been removed since this node was rendered — the index
-              // could be stale and out-of-bounds in the user's data array
-              // (regression test in e2e/.../stale-index.spec.ts, fix #1148).
-              // The === comparison naturally handles the React-replaced-
-              // a-node-for-the-same-key case: that entry now points to a
-              // different node, so this loop won't match.
-              for (const [cacheKey, cachedNode] of this.elementsCache) {
-                if (cachedNode === node) {
-                  this.elementsCache.delete(cacheKey)
-                  break
-                }
-              }
-              return
-            }
-
-            if (!this.isIndexInRange(index)) return
-
-            if (this.shouldMeasureDuringScroll(index)) {
-              this.resizeItem(
-                index,
-                this.options.measureElement(node, entry, this),
-              )
+        const run = () => {
+          // Measure every entry before notifying. A notify that adjusted
+          // scroll re-renders synchronously, and that render can unmount
+          // nodes whose entries are still queued here, leaving them
+          // unmeasured. With lanes, a half-measured row lets one lane drift
+          // away from the others (#1036).
+          const batch: { sync: boolean; notify?: boolean } = { sync: false }
+          this._resizeBatch = batch
+          try {
+            entries.forEach(measureEntry)
+          } finally {
+            this._resizeBatch = null
+            if (batch.notify) {
+              this.notify(batch.sync)
+              this._retryClampedAdjustment()
             }
           }
-          this.options.useAnimationFrameWithResizeObserver
-            ? requestAnimationFrame(run)
-            : run()
-        })
+        }
+        this.options.useAnimationFrameWithResizeObserver
+          ? requestAnimationFrame(run)
+          : run()
       }))
+    }
+
+    const measureEntry = (entry: ResizeObserverEntry) => {
+      const node = entry.target as TItemElement
+      const index = this.indexFromElement(node)
+
+      if (!node.isConnected) {
+        this.observer.unobserve(node)
+        // Find the cache entry pointing to this exact node and remove
+        // it. We can't call getItemKey(index) here because items may
+        // have been removed since this node was rendered — the index
+        // could be stale and out-of-bounds in the user's data array
+        // (regression test in e2e/.../stale-index.spec.ts, fix #1148).
+        // The === comparison naturally handles the React-replaced-
+        // a-node-for-the-same-key case: that entry now points to a
+        // different node, so this loop won't match.
+        for (const [cacheKey, cachedNode] of this.elementsCache) {
+          if (cachedNode === node) {
+            this.elementsCache.delete(cacheKey)
+            break
+          }
+        }
+        return
+      }
+
+      if (!this.isIndexInRange(index)) return
+
+      if (this.shouldMeasureDuringScroll(index)) {
+        this.resizeItem(index, this.options.measureElement(node, entry, this))
+      }
     }
 
     return {
@@ -756,7 +787,11 @@ export class Virtualizer<
       isIOSWebKit() &&
       (this.isScrolling || this._iosTouching || this._iosJustTouchEnded)
     ) {
-      this._iosDeferredAdjustment += delta
+      // An index scroll retargets from fresh measurements in reconcileScroll;
+      // replaying this delta after it lands would count it twice.
+      if (this.scrollState?.index == null) {
+        this._iosDeferredAdjustment += delta
+      }
       return false
     } else {
       const target = this.getScrollOffset() + this.scrollAdjustments + delta
@@ -924,6 +959,18 @@ export class Virtualizer<
             Math.abs(offset - this._intendedScrollOffset) < 1.5
           ) {
             offset = this._intendedScrollOffset
+          } else if (
+            this.scrollState?.index != null &&
+            this.scrollState.hasReachedTarget &&
+            !approxEqual(offset, this.scrollState.lastTargetOffset) &&
+            !approxEqual(offset, this.getScrollStateTarget(this.scrollState)) &&
+            (this._clampedAdjustment === null ||
+              Math.abs(offset - this._clampedAdjustment.maxAtWrite) >= 1.5)
+          ) {
+            // The index scroll reached its target, but an external scroll moved
+            // away while we waited for measurements. Our own measurement updates
+            // (including clamped writes) still need to reconcile.
+            this.scrollState = null
           }
           this._intendedScrollOffset = null
 
@@ -1155,6 +1202,14 @@ export class Virtualizer<
       this.reconcileScroll()
     })
   }
+  private getScrollStateTarget(state: ScrollState) {
+    const offsetInfo = state.toEnd
+      ? ([Math.max(this.getMaxScrollOffset(), 0)] as const)
+      : state.index != null
+        ? this.getOffsetForIndex(state.index, state.align)
+        : undefined
+    return offsetInfo ? offsetInfo[0] : state.lastTargetOffset
+  }
   private reconcileScroll() {
     if (!this.scrollState) return
 
@@ -1168,22 +1223,27 @@ export class Virtualizer<
       return
     }
 
-    const offsetInfo =
-      this.scrollState.index != null
-        ? this.getOffsetForIndex(this.scrollState.index, this.scrollState.align)
-        : undefined
-    const targetOffset = offsetInfo
-      ? offsetInfo[0]
-      : this.scrollState.lastTargetOffset
+    // A resize since the last render leaves measurementsCache stale until
+    // something reads getMeasurements(); rebuild it (memoized) so an index
+    // target reflects it even when no render ran in between.
+    this.getMeasurements()
+    const targetOffset = this.getScrollStateTarget(this.scrollState)
 
-    // Require one stable frame where target matches scroll offset.
-    // approxEqual() already tolerates minor fluctuations, so one frame is sufficient
-    // to confirm scroll has reached its target without premature cleanup.
-    const STABLE_FRAMES = 1
+    // Index targets can still depend on cached sizes during the first rAF,
+    // which runs before ResizeObserver delivers pending measurements. Wait
+    // another frame (two when measurements are themselves deferred to rAF)
+    // before retiring an index scroll. Absolute offsets don't need this wait.
+    const STABLE_FRAMES =
+      this.scrollState.index == null
+        ? 1
+        : this.options.useAnimationFrameWithResizeObserver
+          ? 3
+          : 2
 
     const targetChanged = targetOffset !== this.scrollState.lastTargetOffset
 
     if (!targetChanged && approxEqual(targetOffset, this.getScrollOffset())) {
+      this.scrollState.hasReachedTarget = true
       this.scrollState.stableFrames++
       if (this.scrollState.stableFrames >= STABLE_FRAMES) {
         // Final-pass exact landing. The reconcile-stable check uses a 1.01px
@@ -1218,7 +1278,11 @@ export class Virtualizer<
           this.scrollState.behavior === 'smooth' && distance > viewport
 
         this.scrollState.lastTargetOffset = targetOffset
-        if (!keepSmooth) {
+        if (keepSmooth) {
+          // A smooth retarget travels again, so its intermediate scroll
+          // events must not read as an external scroll away from the target.
+          this.scrollState.hasReachedTarget = false
+        } else {
           this.scrollState.behavior = 'auto'
         }
 
@@ -1581,9 +1645,10 @@ export class Virtualizer<
         this.options.count,
         startIndex,
         endIndex,
+        this.options.lanes,
       ]
     },
-    (rangeExtractor, overscan, count, startIndex, endIndex) => {
+    (rangeExtractor, overscan, count, startIndex, endIndex, lanes) => {
       return startIndex === null || endIndex === null
         ? []
         : rangeExtractor({
@@ -1591,6 +1656,7 @@ export class Virtualizer<
             endIndex,
             overscan,
             count,
+            lanes,
           })
     },
     {
@@ -1673,7 +1739,12 @@ export class Virtualizer<
     // Sync-measure when idle (initial render) or during programmatic scrolling
     // (scrollToIndex/scrollToOffset) where reconcileScroll needs sizes in the same frame.
     // During normal user scrolling, skip sync measurement — the RO callback handles it async.
+    // Skip nodes that aren't attached yet: they have no layout and would be
+    // cached as 0. Vue calls function refs during patch, before the parent is
+    // inserted. The node is observed above, so the RO reports its size once
+    // it's connected.
     if (
+      node.isConnected &&
       (!this.isScrolling || this.scrollState) &&
       this.shouldMeasureDuringScroll(index)
     ) {
@@ -1683,6 +1754,14 @@ export class Virtualizer<
 
   resizeItem = (index: number, size: number) => {
     if (!this.isIndexInRange(index)) return
+
+    // An earlier entry in this ResizeObserver batch moved `scrollOffset`.
+    // Outside a batch its sync notify would have re-rendered and rebuilt the
+    // caches read below; rebuild them here so the anchoring check compares
+    // this item's current start, not a stale one, against the adjusted
+    // offset (#1218). Without a scroll move, the caches are exactly as stale
+    // as they were before batching, so skip the rebuild.
+    if (this._resizeBatch?.sync) this.getMeasurements()
 
     // Fast field reads. For lanes===1 we read raw start/size from the flat
     // typed array, avoiding a Proxy.get + VirtualItem allocation per call.
@@ -1775,6 +1854,13 @@ export class Virtualizer<
       // synchronous notify flushes the render in this same callback, so both
       // land in one paint. When nothing moved (or the write was deferred on
       // iOS), keep the cheaper async notify.
+      if (this._resizeBatch) {
+        // Inside a ResizeObserver callback: notify once after every entry
+        // is measured, synchronously if any of them moved `scrollTop`.
+        this._resizeBatch.notify = true
+        this._resizeBatch.sync ||= adjustedSync
+        return
+      }
       this.notify(adjustedSync)
       // A consumer that grows the sizer synchronously inside `onChange`
       // (direct DOM updates) may never re-render when the range is
@@ -1904,9 +1990,14 @@ export class Virtualizer<
     }
 
     // For the last item with 'end' alignment, use browser's actual max scroll
-    // to account for borders/padding that aren't in our measurements
+    // to account for borders/padding that aren't in our measurements (#1001),
+    // but swap paddingEnd for scrollPaddingEnd so the last item lands where
+    // any other end-aligned item would instead of overshooting past it (#1257).
     if (align === 'end' && index === this.options.count - 1) {
-      return [this.getMaxScrollOffset(), align] as const
+      const maxOffset = this.getMaxScrollOffset()
+      const toOffset =
+        maxOffset - this.options.paddingEnd + this.options.scrollPaddingEnd
+      return [Math.max(Math.min(toOffset, maxOffset), 0), align] as const
     }
 
     const toOffset =
@@ -1942,6 +2033,7 @@ export class Virtualizer<
       startedAt: now,
       lastTargetOffset: offset,
       stableFrames: 0,
+      hasReachedTarget: false,
     }
 
     this._scrollToOffset(offset, { adjustments: undefined, behavior })
@@ -1976,6 +2068,7 @@ export class Virtualizer<
       startedAt: now,
       lastTargetOffset: offset,
       stableFrames: 0,
+      hasReachedTarget: approxEqual(offset, this.getScrollOffset()),
     }
 
     this._scrollToOffset(offset, { adjustments: undefined, behavior })
@@ -1997,6 +2090,7 @@ export class Virtualizer<
       startedAt: now,
       lastTargetOffset: offset,
       stableFrames: 0,
+      hasReachedTarget: false,
     }
 
     this._scrollToOffset(offset, { adjustments: undefined, behavior })
@@ -2006,16 +2100,44 @@ export class Virtualizer<
 
   scrollToEnd = ({ behavior = 'auto' }: ScrollToEndOptions = {}) => {
     if (this.options.count > 0) {
-      this.scrollToIndex(this.options.count - 1, {
+      // Target the browser's max scroll rather than the last item's end-align
+      // offset, so paddingEnd is included and isAtEnd() holds afterwards.
+      this._iosDeferredAdjustment = 0
+
+      const offset = Math.max(this.getMaxScrollOffset(), 0)
+
+      this.scrollState = {
+        index: this.options.count - 1,
         align: 'end',
         behavior,
-      })
+        toEnd: true,
+        startedAt: this.now(),
+        lastTargetOffset: offset,
+        stableFrames: 0,
+        hasReachedTarget: approxEqual(offset, this.getScrollOffset()),
+      }
+
+      this._scrollToOffset(offset, { adjustments: undefined, behavior })
+
+      this.scheduleScrollReconcile()
       return
     }
 
     this.scrollToOffset(Math.max(this.getTotalSize() - this.getSize(), 0), {
       behavior,
     })
+  }
+
+  // Drops the target of an in-flight scrollToIndex / scrollToOffset /
+  // scrollBy / scrollToEnd so a user gesture can take over the viewport.
+  // The scroll position is left untouched: writing it would stop iOS
+  // momentum, and a real gesture already interrupts a native smooth scroll.
+  cancelScroll = () => {
+    if (this.rafId != null && this.targetWindow) {
+      this.targetWindow.cancelAnimationFrame(this.rafId)
+      this.rafId = null
+    }
+    this.scrollState = null
   }
 
   getTotalSize = () => {

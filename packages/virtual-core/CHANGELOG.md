@@ -1,5 +1,31 @@
 # @tanstack/virtual-core
 
+## 3.19.0
+
+### Minor Changes
+
+- [#1302](https://github.com/TanStack/virtual/pull/1302) [`92c697f`](https://github.com/TanStack/virtual/commit/92c697f7b9c5189137b14f0b0fb41a29eddedbc6) - fix(virtual-core): keep lanes aligned after changing `lanes` with `measureElement` ([#1036](https://github.com/TanStack/virtual/issues/1036))
+  - `overscan` now counts whole rows when `lanes > 1`, so every lane renders (and measures) the same number of extra items. This renders more items than before: `lanes: 4, overscan: 2` now adds 8 items on each side instead of 2. `Range` gains an optional `lanes` field that `defaultRangeExtractor` reads; a custom `rangeExtractor` gets row overscan only if it delegates to `defaultRangeExtractor`.
+  - A ResizeObserver callback now measures all of its entries before notifying, so a synchronous re-render can no longer unmount part of a row before it is measured.
+
+### Patch Changes
+
+- [#1305](https://github.com/TanStack/virtual/pull/1305) [`28a2174`](https://github.com/TanStack/virtual/commit/28a21741bcc5055bbda9891655630989dc6b7517) - fix(virtual-core): don't replay iOS-deferred size corrections after an in-flight `scrollToIndex` lands
+
+## 3.18.0
+
+### Minor Changes
+
+- [#1300](https://github.com/TanStack/virtual/pull/1300) [`43675bc`](https://github.com/TanStack/virtual/commit/43675bc42e3043cb2cea4dba015df077d9813602) - feat(virtual-core): add `cancelScroll()` to stop an in-flight `scrollToIndex` / `scrollToOffset` / `scrollBy` / `scrollToEnd` from correcting toward its target, so a user gesture can take over the viewport ([#1285](https://github.com/TanStack/virtual/issues/1285))
+
+### Patch Changes
+
+- [#1276](https://github.com/TanStack/virtual/pull/1276) [`9df47a3`](https://github.com/TanStack/virtual/commit/9df47a3215f3fb3d182442316d058e2a96696e4f) - Fix `scrollToIndex(last, { align: 'end' })` overshooting the last item by `paddingEnd`; it now respects `scrollPaddingEnd` like other end-aligned items. To scroll to the very bottom including `paddingEnd`, use `scrollToEnd()`.
+
+- [#1293](https://github.com/TanStack/virtual/pull/1293) [`c644f10`](https://github.com/TanStack/virtual/commit/c644f1096c9f4d8221d92862afdc9316b17df62a) - fix(virtual-core): don't cache a 0 size when `measureElement` receives a node that isn't attached to the document yet
+
+- [#1294](https://github.com/TanStack/virtual/pull/1294) [`2a631f4`](https://github.com/TanStack/virtual/commit/2a631f46f4366227533f45604af3db8e60deb70f) - Keep scrollToIndex reconciliation active until pending ResizeObserver measurements can update its target, including when useAnimationFrameWithResizeObserver is enabled. Respect an external scroll away from a reached target during this settling period.
+
 ## 3.17.11
 
 ### Patch Changes

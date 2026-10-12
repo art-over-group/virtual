@@ -80,7 +80,7 @@ The sync parameter indicates whether scrolling is currently in progress. It is `
 overscan?: number
 ```
 
-The number of items to render above and below the visible area. Increasing this number will increase the amount of time it takes to render the virtualizer, but might decrease the likelihood of seeing slow-rendering blank items at the top and bottom of the virtualizer when scrolling. The default value is `1`.
+The number of items to render above and below the visible area. Increasing this number will increase the amount of time it takes to render the virtualizer, but might decrease the likelihood of seeing slow-rendering blank items at the top and bottom of the virtualizer when scrolling. The default value is `1`. When `lanes` is greater than `1`, overscan counts whole rows of `lanes` items, so every lane renders the same number of extra items.
 
 ### `horizontal`
 
@@ -146,7 +146,7 @@ This function is passed the index of each item and should return a unique key fo
 rangeExtractor?: (range: Range) => number[]
 ```
 
-This function receives visible range indexes and should return array of indexes to render. This is useful if you need to add or remove items from the virtualizer manually regardless of the visible range, eg. rendering sticky items, headers, footers, etc. The default range extractor implementation will return the visible range indexes and is exported as `defaultRangeExtractor`.
+This function receives visible range indexes and should return array of indexes to render. This is useful if you need to add or remove items from the virtualizer manually regardless of the visible range, eg. rendering sticky items, headers, footers, etc. The default range extractor implementation will return the visible range indexes and is exported as `defaultRangeExtractor`. When `lanes` is greater than `1`, `range.lanes` holds the lane count and `defaultRangeExtractor` applies `overscan` as whole rows; a custom extractor that computes its own indexes should do the same to keep lanes aligned.
 
 ### `scrollToFn`
 
@@ -458,6 +458,16 @@ scrollToEnd: (
 Scrolls the virtualizer to the end of the content. For vertical lists this is the bottom; for horizontal lists this is the right edge.
 
 This is useful for "Jump to latest" controls in chat and log views.
+
+### `cancelScroll`
+
+```tsx
+cancelScroll: () => void
+```
+
+Cancels an in-flight `scrollToIndex`, `scrollToOffset`, `scrollBy` or `scrollToEnd`. After those calls, the virtualizer keeps correcting toward the target for a short time while items are measured. Call `cancelScroll` when the user starts their own scroll (for example from `wheel`, `touchstart` or `keydown` handlers) so the viewport stays where the user takes it.
+
+The current scroll position is not changed. It does nothing when no scroll is in flight.
 
 ### `getDistanceFromEnd`
 
